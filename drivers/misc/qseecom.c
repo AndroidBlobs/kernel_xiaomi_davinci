@@ -2,6 +2,7 @@
  * QTI Secure Execution Environment Communicator (QSEECOM) driver
  *
  * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2019 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -203,7 +204,7 @@ struct qseecom_registered_listener_list {
 	phys_addr_t                sb_phys;
 	size_t                     sb_length;
 	wait_queue_head_t          rcv_req_wq;
-	/* rcv_req_flag: 0: ready and empty; 1: received req */
+	/* rcv_req_flag: -1 not ready; 0 ready and empty; 1 received req */
 	int                        rcv_req_flag;
 	int                        send_resp_flag;
 	bool                       listener_in_use;
@@ -428,6 +429,8 @@ static int get_qseecom_keymaster_status(char *str)
 	return 1;
 }
 __setup("androidboot.keymaster=", get_qseecom_keymaster_status);
+
+extern void read_qseelog_wakeup(void);
 
 
 #define QSEECOM_SCM_EBUSY_WAIT_MS 30
@@ -1109,6 +1112,7 @@ static int qseecom_scm_call2(uint32_t svc_id, uint32_t tz_cmd_id,
 		svc_id, tz_cmd_id, qseos_cmd_id, smc_id, desc.arginfo);
 	pr_debug("scm_resp->result = 0x%x, scm_resp->resp_type = 0x%x, scm_resp->data = 0x%x\n",
 		scm_resp->result, scm_resp->resp_type, scm_resp->data);
+	read_qseelog_wakeup();
 	return ret;
 }
 
@@ -1395,7 +1399,7 @@ static int qseecom_register_listener(struct qseecom_dev_handle *data,
 	if (!new_entry)
 		return -ENOMEM;
 	memcpy(&new_entry->svc, &rcvd_lstnr, sizeof(rcvd_lstnr));
-	new_entry->rcv_req_flag = 0;
+	new_entry->rcv_req_flag = -1;
 
 	new_entry->svc.listener_id = rcvd_lstnr.listener_id;
 	new_entry->sb_length = rcvd_lstnr.sb_size;
@@ -1468,7 +1472,7 @@ exit:
 	kzfree(ptr_svc);
 
 	data->released = true;
-	pr_debug("Service %d is unregistered\n", data->listener.id);
+	pr_warn("Service %d is unregistered\n", data->listener.id);
 	return ret;
 }
 
@@ -1502,7 +1506,7 @@ static int qseecom_unregister_listener(struct qseecom_dev_handle *data)
 	list_add_tail(&entry->list,
 		&qseecom.unregister_lsnr_pending_list_head);
 	ptr_svc->unregister_pending = true;
-	pr_debug("unregister %d pending\n", data->listener.id);
+	pr_warn("unregister %d pending\n", data->listener.id);
 	return 0;
 }
 
@@ -1924,9 +1928,12 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 		list_for_each_entry(ptr_svc,
 				&qseecom.registered_listener_list_head, list) {
 			if (ptr_svc->svc.listener_id == lstnr) {
-				ptr_svc->listener_in_use = true;
-				ptr_svc->rcv_req_flag = 1;
-				wake_up_interruptible(&ptr_svc->rcv_req_wq);
+				if (ptr_svc->rcv_req_flag != -1) {
+					ptr_svc->listener_in_use = true;
+					ptr_svc->rcv_req_flag = 1;
+					wake_up_interruptible(
+							&ptr_svc->rcv_req_wq);
+				}
 				break;
 			}
 		}
@@ -1962,6 +1969,12 @@ static int __qseecom_process_incomplete_cmd(struct qseecom_dev_handle *data,
 			goto err_resp;
 		}
 
+		if (ptr_svc->rcv_req_flag == -1) {
+			pr_warn("Service %d is not available\n", lstnr);
+			rc = -ENODEV;
+			status = QSEOS_RESULT_FAILURE;
+			goto err_resp;
+		}
 		pr_debug("waking up rcv_req_wq and waiting for send_resp_wq\n");
 
 		/* initialize the new signal mask with all signals*/
@@ -2258,9 +2271,12 @@ static int __qseecom_reentrancy_process_incomplete_cmd(
 		list_for_each_entry(ptr_svc,
 				&qseecom.registered_listener_list_head, list) {
 			if (ptr_svc->svc.listener_id == lstnr) {
-				ptr_svc->listener_in_use = true;
-				ptr_svc->rcv_req_flag = 1;
-				wake_up_interruptible(&ptr_svc->rcv_req_wq);
+				if (ptr_svc->rcv_req_flag != -1) {
+					ptr_svc->listener_in_use = true;
+					ptr_svc->rcv_req_flag = 1;
+					wake_up_interruptible(
+							&ptr_svc->rcv_req_wq);
+				}
 				break;
 			}
 		}
@@ -2296,6 +2312,12 @@ static int __qseecom_reentrancy_process_incomplete_cmd(
 			goto err_resp;
 		}
 
+		if (ptr_svc->rcv_req_flag == -1) {
+			pr_warn("Service %d is not available\n", lstnr);
+			rc = -ENODEV;
+			status = QSEOS_RESULT_FAILURE;
+			goto err_resp;
+		}
 		pr_debug("waking up rcv_req_wq and waiting for send_resp_wq\n");
 
 		/* initialize the new signal mask with all signals*/
@@ -4139,15 +4161,20 @@ static int qseecom_receive_req(struct qseecom_dev_handle *data)
 		mutex_unlock(&listener_access_lock);
 		return -ENODATA;
 	}
+	if (this_lstnr->rcv_req_flag == -1)
+		this_lstnr->rcv_req_flag = 0;
 	mutex_unlock(&listener_access_lock);
 
 	while (1) {
 		if (wait_event_interruptible(this_lstnr->rcv_req_wq,
 				__qseecom_listener_has_rcvd_req(data,
 				this_lstnr))) {
-			pr_debug("Interrupted: exiting Listener Service = %d\n",
+			pr_warn("Interrupted: exiting Listener Service = %d\n",
 						(uint32_t)data->listener.id);
 			/* woken up for different reason */
+			mutex_lock(&listener_access_lock);
+			this_lstnr->rcv_req_flag = -1;
+			mutex_unlock(&listener_access_lock);
 			return -ERESTARTSYS;
 		}
 
@@ -7981,7 +8008,7 @@ static int qseecom_release(struct inode *inode, struct file *file)
 			data->type, data->mode, data);
 		switch (data->type) {
 		case QSEECOM_LISTENER_SERVICE:
-			pr_debug("release lsnr svc %d\n", data->listener.id);
+			pr_warn("release lsnr svc %d\n", data->listener.id);
 			free_private_data = false;
 			mutex_lock(&listener_access_lock);
 			ret = qseecom_unregister_listener(data);
